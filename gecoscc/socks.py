@@ -1,12 +1,18 @@
 import logging
-import gevent
-import simplejson as json
 import time
 
+import gevent
+import memcache
+import simplejson as json
+
 from datetime import datetime, timedelta
-from pyramid_sockjs import get_session_manager
-from gevent.queue import Empty, Queue
 from heapq import heappush, heappop
+
+from gevent.queue import Empty, Queue
+
+from pyramid.threadlocal import get_current_registry
+from pyramid_sockjs import get_session_manager
+from pyramid_sockjs.session import (STATE_OPEN, STATE_CLOSING, STATE_CLOSED, Session)
 
 log = logging.getLogger('gecoscc.socks')
 
@@ -39,19 +45,13 @@ def invalidate_jobs(request):
     }))
 
 
-STATE_NEW = 0
-STATE_OPEN = 1
-STATE_CLOSING = 2
-STATE_CLOSED = 3
-
-
 class QueueMemCached(Queue):
 
     def __init__(self, session_id, *args, **kwargs):
         super(QueueMemCached, self).__init__(*args, **kwargs)
         self.session_id = session_id
-        import memcache
-        self.mc = memcache.Client(['127.0.0.1:11211'], debug=0)
+        settings = get_current_registry().settings
+        self.mc = memcache.Client([settings['session.memcache_backend']], debug=0)
 
     def put_nowait(self, item):
         sessions = self.mc.get('sessions')
@@ -76,7 +76,7 @@ class QueueMemCached(Queue):
             raise Empty
 
 
-class SessionMemCached(object):
+class SessionMemCached(Session):
     """ SockJS session object
 
     ``state``: Session state
@@ -93,13 +93,6 @@ class SessionMemCached(object):
 
     """
 
-    manager = None
-    request = None
-    registry = None
-    acquired = False
-    timeout = timedelta(seconds=10)
-    state = STATE_NEW
-
     def __init__(self, id, timeout=timedelta(seconds=10), request=None):
         self.id = id
         self.expired = False
@@ -107,98 +100,11 @@ class SessionMemCached(object):
         self.request = request
         self.registry = getattr(request, 'registry', None)
         self.expires = datetime.now() + timeout
-
         self.queue = QueueMemCached(id)
 
         self.hits = 0
         self.heartbeats = 0
         self.name = 'sockjs'
-
-    def __str__(self):
-        result = ['id=%r' % (self.id,)]
-
-        if self.state == STATE_OPEN:
-            result.append('connected')
-        else:
-            result.append('disconnected')
-
-        if self.queue.qsize():
-            result.append('queue[%s]' % self.queue.qsize())
-        if self.hits:
-            result.append('hits=%s' % self.hits)
-        if self.heartbeats:
-            result.append('heartbeats=%s' % self.heartbeats)
-
-        return ' '.join(result)
-
-    def tick(self, timeout=None):
-        self.expired = False
-
-        if timeout is None:
-            self.expires = datetime.now() + self.timeout
-        else:
-            self.expires = datetime.now() + timeout
-
-    def heartbeat(self):
-        self.heartbeats += 1
-
-    def expire(self):
-        """ Manually expire a session. """
-        self.expired = True
-
-    def open(self):
-        log.debug('open session: %s', self.id)
-        self.state = STATE_OPEN
-        try:
-            self.on_open()
-        except:
-            log.exception("Exceptin in .on_open method.")
-
-    def close(self):
-        """ close session """
-        log.debug('close session: %s', self.id)
-        self.state = STATE_CLOSING
-        try:
-            self.on_close()
-        except:
-            log.exception("Exceptin in .on_close method.")
-
-    def closed(self):
-        log.debug('session closed: %s', self.id)
-        self.state = STATE_CLOSED
-        self.release()
-        self.expire()
-        try:
-            self.on_closed()
-        except:
-            log.exception("Exceptin in .on_closed method.")
-
-    def acquire(self, request=None):
-        self.manager.acquire(self, request)
-
-    def release(self):
-        if self.manager is not None:
-            self.manager.release(self)
-
-    def get_transport_message(self, block=True, timeout=None):
-        self.tick()
-        return self.queue.get(block=block, timeout=timeout)
-
-    def send(self, msg):
-        """ send message to client """
-        if self.manager.debug:
-            log.debug('outgoing message: %s, %s', self.id, str(msg)[:200])
-
-        self.tick()
-        self.queue.put_nowait(msg)
-
-    def message(self, msg):
-        log.debug('incoming message: %s, %s', self.id, msg[:200])
-        self.tick()
-        try:
-            self.on_message(msg)
-        except:
-            log.exception("Exceptin in .on_message method.")
 
     def serialize(self):
         return {'hits': self.hits,
@@ -216,22 +122,6 @@ class SessionMemCached(object):
         session.manager = manager
         session.registry = registry
         return session
-
-    def on_open(self):
-        """ override in subsclass """
-
-    def on_message(self, msg):
-        """ executes when new message is received from client """
-
-    def on_close(self):
-        """ executes after session marked as closing """
-
-    def on_closed(self):
-        """ executes after session marked as closed """
-
-    def on_remove(self):
-        """ executes before removing from session manager """
-
 
 _marker = object()
 
@@ -251,8 +141,8 @@ class SessionMemCachedManager(object):
         self.registry = registry
         if session is not None:
             self.factory = session
-        import memcache
-        self.mc = memcache.Client(['127.0.0.1:11211'], debug=0)
+        settings = registry.settings
+        self.mc = memcache.Client([settings['session.memcache_backend']], debug=0)
 
         self.acquired = {}
         self.pool = []
