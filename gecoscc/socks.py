@@ -1,10 +1,11 @@
 import logging
 import gevent
 import simplejson as json
+import time
 
 from datetime import datetime, timedelta
 from pyramid_sockjs import get_session_manager
-from gevent.queue import Queue
+from gevent.queue import Empty, Queue
 from heapq import heappush, heappop
 
 log = logging.getLogger('gecoscc.socks')
@@ -44,7 +45,38 @@ STATE_CLOSING = 2
 STATE_CLOSED = 3
 
 
-class Session(object):
+class QueueMemCached(Queue):
+
+    def __init__(self, session_id, *args, **kwargs):
+        super(QueueMemCached, self).__init__(*args, **kwargs)
+        self.session_id = session_id
+        import memcache
+        self.mc = memcache.Client(['127.0.0.1:11211'], debug=0)
+
+    def put_nowait(self, item):
+        sessions = self.mc.get('sessions')
+        session = sessions[self.session_id]
+        if 'queue' not in session:
+            session['queue'] = []
+        queue = session['queue']
+        queue.append(item)
+        self.mc.set('sessions', sessions)
+
+    def get(self, block=True, timeout=timedelta(seconds=5)):
+        if block:
+            time.sleep(timeout)
+        sessions = self.mc.get('sessions')
+        session = sessions[self.session_id]
+        queue = session.get('queue', [])
+        try:
+            item = queue.pop()
+            self.mc.set('sessions', sessions)
+            return item
+        except IndexError:
+            raise Empty
+
+
+class SessionMemCached(object):
     """ SockJS session object
 
     ``state``: Session state
@@ -76,10 +108,11 @@ class Session(object):
         self.registry = getattr(request, 'registry', None)
         self.expires = datetime.now() + timeout
 
-        self.queue = Queue()
+        self.queue = QueueMemCached(id)
 
         self.hits = 0
         self.heartbeats = 0
+        self.name = 'sockjs'
 
     def __str__(self):
         result = ['id=%r' % (self.id,)]
@@ -167,6 +200,23 @@ class Session(object):
         except:
             log.exception("Exceptin in .on_message method.")
 
+    def serialize(self):
+        return {'hits': self.hits,
+                'heartbeats': self.heartbeats,
+                'expires': self.expires,
+                'timeout': self.timeout,
+                'expired': self.expired,
+                'id': self.id}
+
+    @classmethod
+    def deserialize(self, value, manager, registry, request=None):
+        session = SessionMemCached(id=value['id'],
+                                   timeout=value['timeout'],
+                                   request=request)
+        session.manager = manager
+        session.registry = registry
+        return session
+
     def on_open(self):
         """ override in subsclass """
 
@@ -186,10 +236,10 @@ class Session(object):
 _marker = object()
 
 
-class SessionManager(dict):
+class SessionMemCachedManager(object):
     """ A basic session manager """
 
-    factory = Session
+    factory = SessionMemCached
 
     _gc_thread = None
     _gc_thread_stop = False
@@ -197,16 +247,64 @@ class SessionManager(dict):
     def __init__(self, name, registry, session=None,
                  gc_cycle=5.0, timeout=timedelta(seconds=10)):
         self.name = name
-        self.route_name = 'sockjs-url-%s'%name
+        self.route_name = 'sockjs-url-%s' % name
         self.registry = registry
         if session is not None:
             self.factory = session
+        import memcache
+        self.mc = memcache.Client(['127.0.0.1:11211'], debug=0)
+
         self.acquired = {}
         self.pool = []
+        self.sessions = {}
         self.timeout = timeout
-        debug = registry.settings.get('debug_sockjs','').lower()
-        self.debug = debug in ('true','t','yes')
+        debug = registry.settings.get('debug_sockjs', '').lower()
+        self.debug = debug in ('true', 't', 'yes')
         self._gc_cycle = gc_cycle
+
+    @property
+    def acquired(self):
+        return self.mc.get('acquired')
+
+    @acquired.setter
+    def acquired(self, value):
+        return self.mc.set('acquired', value)
+
+    @property
+    def pool(self):
+        return self.mc.get('pool')
+
+    @pool.setter
+    def pool(self, value):
+        return self.mc.set('pool', value)
+
+    @property
+    def sessions(self):
+        return self.mc.get('sessions')
+
+    @sessions.setter
+    def sessions(self, value):
+        return self.mc.set('sessions', value)
+
+    def add_session(self, session_id, session):
+        sessions = self.mc.get('sessions')
+        sessions[session_id] = session.serialize()
+        self.sessions = sessions
+
+    def remove_session(self, session_id):
+        sessions = self.mc.get('sessions')
+        del sessions[session_id]
+        self.sessions = sessions
+
+    def add_acquired(self, session_id, acquired_value):
+        acquired = self.mc.get('acquired')
+        acquired[session_id] = acquired_value
+        self.acquired = acquired
+
+    def remove_acquired(self, session_id):
+        acquired = self.mc.get('acquired')
+        del acquired[session_id]
+        self.acquired = acquired
 
     def route_url(self, request):
         return request.route_url(self.route_name)
@@ -216,7 +314,8 @@ class SessionManager(dict):
             def _gc_sessions():
                 while not self._gc_thread_stop:
                     gevent.sleep(self._gc_cycle)
-                    self._gc() # pragma: no cover
+                    # TODO: Uncomment _gc
+                    # self._gc() # pragma: no cover
 
             self._gc_thread = gevent.Greenlet(_gc_sessions)
 
@@ -230,12 +329,11 @@ class SessionManager(dict):
 
     def _gc(self):
         current_time = datetime.now()
-
         while self.pool:
             expires, session = self.pool[0]
 
             # check if session is removed
-            if session.id in self:
+            if session.id in self.sessions:
                 if expires > current_time:
                     break
             else:
@@ -247,15 +345,15 @@ class SessionManager(dict):
             # Session is to be GC'd immedietely
             if session.expires < current_time:
                 if not self.on_session_gc(session):
-                    del self[session.id]
+                    self.remove_session(session.id)
                     if session.id in self.acquired:
-                        del self.acquired[session.id]
+                        self.remove_acquired(session.id)
                     if session.state == STATE_OPEN:
                         session.close()
                     if session.state == STATE_CLOSING:
                         session.closed()
                 continue
-
+            # TODO: This does not work still
             heappush(self.pool, (session.expires, session))
 
     def on_session_gc(self, session):
@@ -267,12 +365,12 @@ class SessionManager(dict):
 
         session.manager = self
         session.registry = self.registry
-
-        self[session.id] = session
+        self.add_session(session.id, session)
+        # TODO: This does not work still
         heappush(self.pool, (session.expires, session))
 
     def get(self, id, create=False, request=None, default=_marker):
-        session = super(SessionManager, self).get(id, None)
+        session = self.sessions.get(id, None)
         if session is None:
             if create:
                 session = self.factory(id, self.timeout, request=request)
@@ -286,10 +384,9 @@ class SessionManager(dict):
 
     def acquire(self, session, request=None):
         sid = session.id
-
         if sid in self.acquired:
-            raise KeyError("Another connection still open")
-        if sid not in self:
+            raise KeyError("Another connection still open2")
+        if sid not in self.sessions:
             raise KeyError("Unknown session")
 
         session.tick()
@@ -306,7 +403,7 @@ class SessionManager(dict):
 
     def release(self, session):
         if session.id in self.acquired:
-            del self.acquired[session.id]
+            self.remove_acquired(session.id)
 
     def active_sessions(self):
         for session in self.values():
@@ -319,13 +416,17 @@ class SessionManager(dict):
             expr, session = heappop(self.pool)
             if session.state != STATE_CLOSED:
                 session.closed()
-            del self[session.id]
+            self.remove_session(session.id)
 
     def broadcast(self, *args, **kw):
-        for session in self.values():
+        sessions = self.sessions
+        for session_value in sessions.values():
+            session = SessionMemCached.deserialize(session_value,
+                                                   self, self.registry)
+
             if not session.expired:
                 session.send(*args, **kw)
 
     def __del__(self):
-        self.clear()
+        self.sessions.flush_all()
         self.stop()

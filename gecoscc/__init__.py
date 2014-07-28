@@ -5,13 +5,13 @@ from pyramid.config import Configurator
 from pyramid.exceptions import ConfigurationError
 from pyramid.authentication import SessionAuthenticationPolicy
 from pyramid.authorization import ACLAuthorizationPolicy
-from pyramid_sockjs.session import SessionMemCached, SessionMemCachedManager, SessionManager
 
 from gecoscc.db import MongoDB, get_db
-from gecoscc.models import get_root
-from gecoscc.userdb import get_userdb, get_groups, get_user
 from gecoscc.eventsmanager import get_jobstorage
+from gecoscc.models import get_root
 from gecoscc.permissions import is_logged, LoggedFactory, SuperUserFactory, SuperUserOrMyProfileFactory
+from gecoscc.userdb import get_userdb, get_groups, get_user
+from gecoscc.socks import SessionMemCached, SessionMemCachedManager
 
 
 def read_setting_from_env(settings, key, default=None):
@@ -39,9 +39,17 @@ def route_config(config):
     config.add_route('i18n_catalog', '/i18n-catalog/')
     config.add_route('login', '/login/')
     config.add_route('logout', 'logout/')
-    config.add_sockjs_route('sockjs', prefix='/sockjs',
-                            per_user=True,
-                            cookie_needed=True)
+
+    memcache_backend = config.registry.settings['session.memcache_backend']
+    sock_js_attr = dict(name='sockjs',
+                        prefix='/sockjs',
+                        per_user=True,
+                        cookie_needed=True)
+    if memcache_backend:
+        session_manager = SessionMemCachedManager('sockjs', config.registry, session=SessionMemCached)
+        sock_js_attr['session'] = SessionMemCached
+        sock_js_attr['session_manager'] = session_manager
+    config.add_sockjs_route(**sock_js_attr)
 
     config.add_route('forbidden-view', '/error403/')
 
