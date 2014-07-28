@@ -5,11 +5,12 @@ from pyramid.config import Configurator
 from pyramid.exceptions import ConfigurationError
 from pyramid.authentication import SessionAuthenticationPolicy
 from pyramid.authorization import ACLAuthorizationPolicy
+from pyramid_sockjs.session import SessionMemCached, SessionMemCachedManager, SessionManager
 
 from gecoscc.db import MongoDB, get_db
 from gecoscc.models import get_root
 from gecoscc.userdb import get_userdb, get_groups, get_user
-from gecoscc.eventsmanager import EventsManager, get_jobstorage
+from gecoscc.eventsmanager import get_jobstorage
 from gecoscc.permissions import is_logged, LoggedFactory, SuperUserFactory, SuperUserOrMyProfileFactory
 
 
@@ -39,16 +40,10 @@ def route_config(config):
     config.add_route('login', '/login/')
     config.add_route('logout', 'logout/')
     config.add_sockjs_route('sockjs', prefix='/sockjs',
-                            session=EventsManager,
                             per_user=True,
                             cookie_needed=True)
 
     config.add_route('forbidden-view', '/error403/')
-
-
-def route_config_auxiliary(config, route_prefix):
-    config.add_route('sockjs_home', route_prefix)
-    config.add_route('sockjs_message', '%smessage/' % route_prefix)
 
 
 def database_config(config):
@@ -159,7 +154,6 @@ def main(global_config, **settings):
                           'pyramid.events.NewRequest')
 
     route_config(config)
-    route_config_auxiliary(config, route_prefix='/sjs/')
 
     config.set_request_property(is_logged, 'is_logged', reify=True)
     config.set_request_property(get_jobstorage, 'jobs', reify=True)
