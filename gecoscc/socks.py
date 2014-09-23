@@ -1,4 +1,5 @@
 import logging
+import Queue
 import time
 
 import gevent
@@ -8,7 +9,7 @@ import simplejson as json
 from datetime import datetime, timedelta
 from heapq import heappush, heappop
 
-from gevent.queue import Empty, Queue
+from gevent.queue import Empty, Queue as GeventQueue
 
 from pyramid.threadlocal import get_current_registry
 from pyramid_sockjs import get_session_manager
@@ -45,13 +46,49 @@ def invalidate_jobs(request):
     }))
 
 
-class QueueMemCached(Queue):
+# See http://stackoverflow.com/questions/9539052/python-dynamically-changing-base-classes-at-runtime-how-to
+# Don't inherit client from threading.local so that we can reuse clients in
+# different threads
+memcache.Client = type('Client', (object,), dict(memcache.Client.__dict__))
+# Client.__init__ references local, so need to replace that, too
 
-    def __init__(self, session_id, *args, **kwargs):
+
+class Local(object):
+    pass
+
+memcache.local = Local
+
+
+class PoolClient(object):
+    '''Pool of memcache clients that has the same API as memcache.Client'''
+    def __init__(self, pool_size=10, pool_timeout=3, *args, **kwargs):
+        self.pool_timeout = pool_timeout
+        self.queue = Queue.Queue()
+        for _i in range(pool_size):
+            self.queue.put(memcache.Client(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return lambda *args, **kw: self._call_client_method(name, *args, **kw)
+
+    def _call_client_method(self, name, *args, **kwargs):
+        try:
+            client = self.queue.get(timeout=self.pool_timeout)
+        except Queue.Empty:
+            return
+
+        try:
+            return getattr(client, name)(*args, **kwargs)
+        finally:
+            self.queue.put(client)
+
+
+class QueueMemCached(GeventQueue):
+
+    def __init__(self, session_id, mc=None, *args, **kwargs):
         super(QueueMemCached, self).__init__(*args, **kwargs)
         self.session_id = session_id
         settings = get_current_registry().settings
-        self.mc = memcache.Client([settings['session.memcache_backend']], debug=0)
+        self.mc = mc or PoolClient(10, 3, [settings['session.memcache_backend']], debug=0)
 
     def put_nowait(self, item):
         sessions = self.mc.get('sessions')
@@ -93,18 +130,20 @@ class SessionMemCached(Session):
 
     """
 
-    def __init__(self, id, timeout=timedelta(seconds=10), request=None):
+    def __init__(self, id, timeout=timedelta(seconds=10), request=None, mc=None):
         self.id = id
-        self.expired = False
-        self.timeout = timeout
+        self.name = 'sockjs'
         self.request = request
         self.registry = getattr(request, 'registry', None)
-        self.expires = datetime.now() + timeout
-        self.queue = QueueMemCached(id)
+        settings = get_current_registry().settings
+        self.queue = QueueMemCached(id, mc=mc)
+        self.mc = mc or PoolClient(10, 3, [settings['session.memcache_backend']], debug=0)
 
+        self.expired = False
+        self.timeout = timeout
+        self.expires = datetime.now() + timeout
         self.hits = 0
         self.heartbeats = 0
-        self.name = 'sockjs'
 
     def serialize(self):
         return {'hits': self.hits,
@@ -118,7 +157,8 @@ class SessionMemCached(Session):
     def deserialize(self, value, manager, registry, request=None):
         session = SessionMemCached(id=value['id'],
                                    timeout=value['timeout'],
-                                   request=request)
+                                   request=request,
+                                   mc=manager.mc)
         session.manager = manager
         session.registry = registry
         return session
@@ -135,14 +175,14 @@ class SessionMemCachedManager(object):
     _gc_thread_stop = False
 
     def __init__(self, name, registry, session=None,
-                 gc_cycle=5.0, timeout=timedelta(seconds=10)):
+                 gc_cycle=10.0, timeout=timedelta(seconds=10)):
         self.name = name
         self.route_name = 'sockjs-url-%s' % name
         self.registry = registry
         if session is not None:
             self.factory = session
         settings = registry.settings
-        self.mc = memcache.Client([settings['session.memcache_backend']], debug=0)
+        self.mc = PoolClient(10, 3, [settings['session.memcache_backend']], debug=0)
 
         self.acquired = {}
         self.pool = []
@@ -158,7 +198,7 @@ class SessionMemCachedManager(object):
 
     @acquired.setter
     def acquired(self, value):
-        return self.mc.set('acquired', value)
+        return self.mc.set('acquired', value, 0)
 
     @property
     def pool(self):
@@ -166,7 +206,8 @@ class SessionMemCachedManager(object):
 
     @pool.setter
     def pool(self, value):
-        return self.mc.set('pool', value)
+        success = self.mc.set('pool', value, 0)
+        return success
 
     @property
     def sessions(self):
@@ -174,7 +215,7 @@ class SessionMemCachedManager(object):
 
     @sessions.setter
     def sessions(self, value):
-        return self.mc.set('sessions', value)
+        return self.mc.set('sessions', value, 0)
 
     def add_session(self, session_id, session):
         sessions = self.mc.get('sessions')
@@ -196,6 +237,17 @@ class SessionMemCachedManager(object):
         del acquired[session_id]
         self.acquired = acquired
 
+    def add_session_in_pool(self, session):
+        pool = self.pool
+        heappush(pool, (session.expires, session.serialize()))
+        self.pool = pool
+
+    def pop_session_pool(self, index):
+        pool = self.pool
+        item = pool.pop(index)
+        self.pool = pool
+        return item
+
     def route_url(self, request):
         return request.route_url(self.route_name)
 
@@ -204,9 +256,7 @@ class SessionMemCachedManager(object):
             def _gc_sessions():
                 while not self._gc_thread_stop:
                     gevent.sleep(self._gc_cycle)
-                    # TODO: Uncomment _gc
-                    # self._gc() # pragma: no cover
-
+                    self._gc()  # pragma: no cover
             self._gc_thread = gevent.Greenlet(_gc_sessions)
 
         if not self._gc_thread:
@@ -219,18 +269,22 @@ class SessionMemCachedManager(object):
 
     def _gc(self):
         current_time = datetime.now()
-        while self.pool:
-            expires, session = self.pool[0]
-
+        pool = self.pool
+        while pool:
+            expires, session_value = pool[0]
+            session = SessionMemCached.deserialize(session_value,
+                                                   self, self.registry)
             # check if session is removed
             if session.id in self.sessions:
                 if expires > current_time:
                     break
             else:
-                self.pool.pop(0)
+                self.pop_session_pool(0)
                 continue
 
-            expires, session = self.pool.pop(0)
+            expires, session_value = self.pop_session_pool(0)
+            session = SessionMemCached.deserialize(session_value,
+                                                   self, self.registry)
 
             # Session is to be GC'd immedietely
             if session.expires < current_time:
@@ -243,8 +297,7 @@ class SessionMemCachedManager(object):
                     if session.state == STATE_CLOSING:
                         session.closed()
                 continue
-            # TODO: This does not work still
-            heappush(self.pool, (session.expires, session))
+            self.add_session_in_pool(session)
 
     def on_session_gc(self, session):
         return session.on_remove()
@@ -256,8 +309,7 @@ class SessionMemCachedManager(object):
         session.manager = self
         session.registry = self.registry
         self.add_session(session.id, session)
-        # TODO: This does not work still
-        heappush(self.pool, (session.expires, session))
+        self.add_session_in_pool(session)
 
     def get(self, id, create=False, request=None, default=_marker):
         session = self.sessions.get(id, None)
@@ -275,7 +327,7 @@ class SessionMemCachedManager(object):
     def acquire(self, session, request=None):
         sid = session.id
         if sid in self.acquired:
-            raise KeyError("Another connection still open2")
+            raise KeyError("Another connection still open")
         if sid not in self.sessions:
             raise KeyError("Unknown session")
 
@@ -308,6 +360,10 @@ class SessionMemCachedManager(object):
                 session.closed()
             self.remove_session(session.id)
 
+        self.sessions.flush_all()
+        self.pool.flush_all()
+        self.acquired.flush_all()
+
     def broadcast(self, *args, **kw):
         sessions = self.sessions
         for session_value in sessions.values():
@@ -318,5 +374,5 @@ class SessionMemCachedManager(object):
                 session.send(*args, **kw)
 
     def __del__(self):
-        self.sessions.flush_all()
+        self.clear()
         self.stop()

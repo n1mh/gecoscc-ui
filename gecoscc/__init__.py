@@ -1,10 +1,11 @@
 import os
 import pymongo
 
-from pyramid.config import Configurator
-from pyramid.exceptions import ConfigurationError
 from pyramid.authentication import SessionAuthenticationPolicy
 from pyramid.authorization import ACLAuthorizationPolicy
+from pyramid.config import Configurator
+from pyramid.exceptions import ConfigurationError
+
 
 from gecoscc.db import MongoDB, get_db
 from gecoscc.eventsmanager import get_jobstorage
@@ -34,18 +35,17 @@ def route_config(config):
     config.add_route('admins_set_variables', '/admins/variables/{username}/', factory=SuperUserOrMyProfileFactory)
     config.add_route('admin_delete', '/admins/delete/', factory=SuperUserOrMyProfileFactory)
 
-    config.add_route('groups', '/groups/', factory=LoggedFactory)
     config.add_route('reports', '/reports/', factory=LoggedFactory)
     config.add_route('i18n_catalog', '/i18n-catalog/')
     config.add_route('login', '/login/')
     config.add_route('logout', 'logout/')
 
-    memcache_backend = config.registry.settings['session.memcache_backend']
+    memcache_backend = config.registry.settings.get('session.memcache_backend', None)
     sock_js_attr = dict(name='sockjs',
                         prefix='/sockjs',
                         per_user=True,
                         cookie_needed=True)
-    if memcache_backend:
+    if memcache_backend and memcache_backend != 'false':
         session_manager = SessionMemCachedManager('sockjs', config.registry, session=SessionMemCached)
         sock_js_attr['session'] = SessionMemCached
         sock_js_attr['session_manager'] = session_manager
