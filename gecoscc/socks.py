@@ -145,6 +145,57 @@ class SessionMemCached(Session):
         self.hits = 0
         self.heartbeats = 0
 
+    def get_attr_of_memcached(self, attr):
+        sessions = self.mc.get('sessions')
+        session = sessions[self.id]
+        return session[attr]
+
+    def set_attr_of_memcached(self, attr, value):
+        sessions = self.mc.get('sessions')
+        session = sessions[self.id]
+        session[attr] = value
+        return self.mc.set('sessions', sessions)
+
+    # @property
+    # def expired(self):
+        # return self.get_attr_of_memcached('expired')
+
+    # @expired.setter
+    # def expired(self, value):
+        # return self.set_attr_of_memcached('expired', value)
+
+    # @property
+    # def expires(self):
+        # return self.get_attr_of_memcached('expires')
+
+    # @expires.setter
+    # def expires(self, value):
+        # return self.set_attr_of_memcached('expires', value)
+
+    # @property
+    # def heartbeats(self):
+        # return self.get_attr_of_memcached('heartbeats')
+
+    # @heartbeats.setter
+    # def heartbeats(self, value):
+        # return self.set_attr_of_memcached('heartbeats', value)
+
+    # @property
+    # def hits(self):
+        # return self.get_attr_of_memcached('hits')
+
+    # @hits.setter
+    # def hits(self, value):
+        # return self.set_attr_of_memcached('hits', value)
+
+    # @property
+    # def timeout(self):
+        # return self.get_attr_of_memcached('timeout')
+
+    # @timeout.setter
+    # def timeout(self, value):
+        # return self.set_attr_of_memcached('timeout', value)
+
     def serialize(self):
         return {'hits': self.hits,
                 'heartbeats': self.heartbeats,
