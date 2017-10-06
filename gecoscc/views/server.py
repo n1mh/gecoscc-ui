@@ -154,6 +154,8 @@ def getRAMTotal():
     
 def getJSON(url):
     obj = None
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
     req = urllib2.Request(url)
     try:
         stream = urllib2.urlopen(req, timeout=5)
